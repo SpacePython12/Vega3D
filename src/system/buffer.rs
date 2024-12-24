@@ -2,6 +2,7 @@ use crate::util;
 
 use super::System;
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::num::NonZero;
 use std::sync::Arc;
 use parking_lot::*;
@@ -9,7 +10,8 @@ use parking_lot::*;
 use wgpu::util::DeviceExt;
 
 use super::BinaryData;
-pub struct TypedBufferSlice<'a, T: ?Sized> {
+
+pub struct BufferSlice<'a, T: ?Sized> {
     buffer: &'a wgpu::Buffer,
     offset: u64,
     size: NonZero<u64>,
@@ -17,21 +19,50 @@ pub struct TypedBufferSlice<'a, T: ?Sized> {
     phantom: PhantomData<&'a mut T>
 }
 
-impl<'a, T: ?Sized> TypedBufferSlice<'a, T> {
+pub type ByteBufferSlice<'a> = BufferSlice<'a, [u8]>;
+
+impl<'a, T: ?Sized> BufferSlice<'a, T> {
+    #[inline]
+    pub fn cast_to<U: BinaryData>(self) -> BufferSlice<'a, U> {
+        assert_eq!(self.size(), size_of::<U>());
+        BufferSlice {
+            buffer: &self.buffer,
+            offset: self.offset,
+            size: self.size,
+            mapped: self.mapped,
+            phantom: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn cast_to_array<U: BinaryData>(self) -> BufferSlice<'a, [U]> {
+        assert_eq!(self.size() % size_of::<U>(), 0);
+        BufferSlice {
+            buffer: &self.buffer,
+            offset: self.offset,
+            size: self.size,
+            mapped: self.mapped,
+            phantom: PhantomData,
+        }
+    }
+
+    #[inline]
     pub fn buffer_slice(&self) -> wgpu::BufferSlice<'_> {
         self.buffer.slice(self.offset..self.offset+self.size.get())
     }
 
+    #[inline]
     pub fn offset(&self) -> usize {
         self.offset as usize
     }
 
+    #[inline]
     pub fn size(&self) -> usize {
         self.size.get() as usize
     }
 }
 
-impl<'a, T: BinaryData> TypedBufferSlice<'a, T> {
+impl<'a, T: BinaryData> BufferSlice<'a, T> {
     pub fn write(&self, data: &T) {
         System::queue().write_buffer(&self.buffer, self.offset, bytemuck::bytes_of(data));
     }
@@ -103,7 +134,7 @@ impl<'a, T: BinaryData> TypedBufferSlice<'a, T> {
     
 }
 
-impl<'a, T: BinaryData> TypedBufferSlice<'a, [T]> {
+impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
     pub fn write_array(&self, data: &[T]) {
         assert_eq!(self.size.get(), data.len() as u64);
         System::queue().write_buffer(&self.buffer, self.offset, bytemuck::cast_slice(data));
@@ -318,8 +349,8 @@ impl<'a, T: BinaryData> Buffer<'a, T> {
     }
 
     #[inline]
-    pub fn buffer_slice(&self) -> TypedBufferSlice<'_, T> {
-        TypedBufferSlice {
+    pub fn buffer_slice(&self) -> BufferSlice<'_, T> {
+        BufferSlice {
             buffer: &self.buffer,
             offset: 0,
             size: NonZero::new(size_of::<T>() as u64).unwrap(),
@@ -375,7 +406,7 @@ impl<'a, T: BinaryData> Buffer<'a, [T]> {
     }
 
     #[inline]
-    pub fn buffer_slice_array(&self, range: impl std::ops::RangeBounds<usize>) -> TypedBufferSlice<'_, [T]> {
+    pub fn buffer_slice_array(&self, range: impl std::ops::RangeBounds<usize>) -> BufferSlice<'_, [T]> {
         let offset = match range.start_bound() {
             std::ops::Bound::Included(val) => *val,
             std::ops::Bound::Excluded(val) => *val + 1,
@@ -392,7 +423,7 @@ impl<'a, T: BinaryData> Buffer<'a, [T]> {
 
         assert!(offset + length <= self.len());
 
-        TypedBufferSlice {
+        BufferSlice {
             buffer: &self.buffer,
             offset: (size_of::<T>() * offset) as u64,
             size: NonZero::new((size_of::<T>() * length) as u64).unwrap(),

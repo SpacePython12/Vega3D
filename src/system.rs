@@ -434,7 +434,21 @@ impl winit::application::ApplicationHandler<gilrs::Event> for SystemEventHandler
                 })
             },
             winit::event::WindowEvent::RedrawRequested => {
-                handler.lock().redraw(&mut system, window_id)
+                let window = System::window(&window_id).unwrap();
+                let frame = loop {
+                    if let Some(frame) = window.request_frame_texture().unwrap() {
+                        break frame;
+                    }
+                };
+
+                let frame_texture = texture::Texture::new_with(&frame.texture);
+
+
+                let res = handler.lock().redraw(&mut system, window_id, &frame_texture);
+
+                frame.present();
+                window.request_redraw();
+                res
             },
             _ => Ok(())
         };

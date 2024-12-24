@@ -1,10 +1,13 @@
-use std::{borrow::Cow, collections::HashMap, num::NonZero, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, num::NonZero, sync::{Arc, OnceLock}};
 
-use serde::{Deserialize, Serialize};
+use parking_lot::*;
+use serde::Deserialize;
 
-use super::System;
+use crate::util;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+use super::{buffer, texture, System};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VertexFormatElementType {
     Float16,
@@ -45,7 +48,7 @@ impl VertexFormatElementType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VertexFormatElement {
     pub name: Option<String>,
     #[serde(rename = "type")]
@@ -100,10 +103,12 @@ pub struct VertexFormat {
     elements: Vec<Arc<VertexFormatElement>>,
     named_elements: HashMap<String, (usize, Arc<VertexFormatElement>)>,
     attrs: Vec<wgpu::VertexAttribute>,
+    step_mode: wgpu::VertexStepMode,
+    size: usize,
 }
 
 impl VertexFormat {
-    pub fn new(elements: Vec<Arc<VertexFormatElement>>) -> Arc<Self> {
+    pub fn new(elements: Vec<Arc<VertexFormatElement>>, step_mode: wgpu::VertexStepMode) -> Arc<Self> {
         let mut named_elements = HashMap::with_capacity(elements.len());
         for (i, element) in elements.iter().enumerate() {
             if let Some(name) = &element.name {
@@ -126,6 +131,8 @@ impl VertexFormat {
             elements,
             named_elements,
             attrs,
+            step_mode,
+            size: offset as usize
         })
     }
 
@@ -138,17 +145,20 @@ impl VertexFormat {
     }
 
     pub fn vertex_size(&self) -> usize {
-        self.elements.iter().fold(0, |size, element| {
-            size + element.element_size()
-        })
+        self.size
     }
 
-    pub fn wgpu_vertex_attrs(&self) -> &[wgpu::VertexAttribute] {
-        &self.attrs
-    }
+
+    pub fn wgpu_vertex_buffer_layout(&self) -> wgpu::VertexBufferLayout<'_> {
+        wgpu::VertexBufferLayout { 
+            array_stride: self.size as u64, 
+            step_mode: self.step_mode, 
+            attributes: &self.attrs
+        }
+    } 
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum BindingFormatType {
     Uniform {
@@ -160,6 +170,7 @@ pub enum BindingFormatType {
     },
     Sampler(wgpu::SamplerBindingType),
     Texture {
+        aspect: wgpu::TextureAspect,
         sample_type: wgpu::TextureSampleType,
         dimension: wgpu::TextureViewDimension,
         multisample: bool,
@@ -171,7 +182,7 @@ pub enum BindingFormatType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BindingFormat {
     name: Option<String>,
     #[serde(rename = "type")]
@@ -197,7 +208,7 @@ impl BindingFormat {
                     min_binding_size: size.and_then(|val| NonZero::new(val.get() as u64))
                 },
                 BindingFormatType::Sampler(sampler_type) => wgpu::BindingType::Sampler(sampler_type),
-                BindingFormatType::Texture { sample_type, dimension, multisample } => wgpu::BindingType::Texture { 
+                BindingFormatType::Texture { aspect: _, sample_type, dimension, multisample } => wgpu::BindingType::Texture { 
                     sample_type, 
                     view_dimension: dimension, 
                     multisampled: multisample 
@@ -216,7 +227,7 @@ impl BindingFormat {
 pub struct BindingGroupFormat {
     bindings: Vec<Arc<BindingFormat>>,
     named_bindings: HashMap<String, (usize, Arc<BindingFormat>)>,
-    layout: Arc<wgpu::BindGroupLayout>,
+    layout: wgpu::BindGroupLayout,
 }
 
 impl BindingGroupFormat {
@@ -232,10 +243,10 @@ impl BindingGroupFormat {
             let entry = binding.into_wgpu_bindgroup_layout_entry(i as u32);
             entries.push(entry);
         }
-        let layout = Arc::new(System::device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+        let layout = System::device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
             label: None, 
             entries: &entries
-        }));
+        });
         Arc::new(Self {
             bindings,
             named_bindings,
@@ -251,8 +262,198 @@ impl BindingGroupFormat {
         &self.named_bindings
     }
 
-    pub fn wgpu_bind_group_layout(&self) -> &Arc<wgpu::BindGroupLayout> {
+    pub fn wgpu_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
         &self.layout
     }
 }
 
+pub struct ShaderModule {
+    shader: wgpu::ShaderModule
+}
+
+impl std::borrow::Borrow<wgpu::ShaderModule> for ShaderModule {
+    fn borrow(&self) -> &wgpu::ShaderModule {
+        &self.shader
+    }
+}
+
+impl ShaderModule {
+    pub fn new_spirv(data: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self {
+            shader: System::device().create_shader_module(wgpu::ShaderModuleDescriptor { 
+                label: None, 
+                source: wgpu::ShaderSource::Naga(
+                    std::borrow::Cow::Owned(naga::front::spv::parse_u8_slice(data, &naga::front::spv::Options {
+                        adjust_coordinate_space: false,
+                        strict_capabilities: true,
+                        block_ctx_dump_prefix: None,
+                    })?)
+                )
+            }),
+        })
+    }
+
+    pub fn new_glsl(source: &str, stage: naga::ShaderStage) -> anyhow::Result<Self> {
+        Ok(Self {
+            shader: System::device().create_shader_module(wgpu::ShaderModuleDescriptor { 
+                label: None, 
+                source: wgpu::ShaderSource::Naga(
+                    std::borrow::Cow::Owned({
+                        let mut frontend = naga::front::glsl::Frontend::default();
+                        frontend.parse(&naga::front::glsl::Options::from(stage), source)?
+                    })
+                )
+            }),
+        })
+    }
+
+    pub fn new_wgsl(source: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            shader: System::device().create_shader_module(wgpu::ShaderModuleDescriptor { 
+                label: None, 
+                source: wgpu::ShaderSource::Naga(
+                    std::borrow::Cow::Owned(naga::front::wgsl::parse_str(source)?)
+                )
+            }),
+        })
+    }
+}
+
+pub struct RenderPipeline {
+    pipeline: wgpu::RenderPipeline
+}
+
+impl RenderPipeline {
+    pub fn new<'a>(
+        binding_group_formats: impl Iterator<Item = &'a BindingGroupFormat>,
+        vertex_shader: (&ShaderModule, Option<&str>),
+        fragment_shader: (&ShaderModule, Option<&str>),
+        vertex_formats: impl Iterator<Item = &'a VertexFormat>,
+        color_targets: impl Iterator<Item = wgpu::ColorTargetState>,
+        depth_stencil: Option<wgpu::DepthStencilState>,
+        primitive: wgpu::PrimitiveState,
+        multisample: wgpu::MultisampleState,
+        multiview: Option<NonZero<u32>>
+    ) -> anyhow::Result<Self> {
+        let bind_group_layouts = binding_group_formats.map(|format| format.wgpu_bind_group_layout()).collect::<Vec<_>>();
+        let pipeline_layout = System::device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { 
+            label: None, 
+            bind_group_layouts: &bind_group_layouts, 
+            push_constant_ranges: &[] 
+        });
+        let vertex_buffer_layouts = vertex_formats.map(|format| format.wgpu_vertex_buffer_layout()).collect::<Vec<_>>();
+        let color_targets = color_targets.map(|target| Some(target)).collect::<Vec<_>>();
+        let pipeline = System::device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { 
+                module: &vertex_shader.0.shader, 
+                entry_point: vertex_shader.1, 
+                compilation_options: Default::default(), 
+                buffers: &vertex_buffer_layouts
+            },
+            primitive,
+            depth_stencil,
+            multisample,
+            fragment: Some(wgpu::FragmentState { 
+                module: &fragment_shader.0.shader, 
+                entry_point: vertex_shader.1, 
+                compilation_options: Default::default(), 
+                targets: &color_targets 
+            }),
+            multiview,
+            cache: None,
+        });
+        Ok(Self {
+            pipeline
+        })
+    }
+}
+
+pub enum Binding<'a> {
+    Buffer(util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>),
+    BufferArray(&'a [util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>]),
+    Sampler(util::MaybeBorrowed<'a, texture::TextureSampler>),
+    SamplerArray(&'a [util::MaybeBorrowed<'a, texture::TextureSampler>]),
+    TextureView(util::MaybeBorrowed<'a, texture::TextureView<'a>>),
+    TextureViewArray(&'a [util::MaybeBorrowed<'a, texture::TextureView<'a>>]),
+}
+
+impl<'a> Binding<'a> {
+    pub fn verify(&self, format: &BindingFormat) -> bool {
+        match (self, format.ty, format.count) {
+            (Binding::Buffer(buffer), BindingFormatType::Uniform { size }, None) => {
+                buffer.size() >= size
+            },
+            (Binding::Buffer(buffer), BindingFormatType::Buffer { read_only, size }, None) => {
+                !size.is_some_and(|size| buffer.size() < size.get())
+            },
+            (Binding::BufferArray(buffers), BindingFormatType::Uniform { size }, Some(count)) => {
+                count.get() == buffers.len() && 
+                buffers.iter().fold(true, |state, buffer| state && buffer.size() >= size)
+            },
+            (Binding::BufferArray(buffers), BindingFormatType::Buffer { read_only, size }, Some(count)) => {
+                count.get() == buffers.len() && !size.is_some_and(|size| !buffers.iter().fold(true, |state, buffer| state && buffer.size() >= size.get()))
+            },
+            (Binding::Sampler(sampler), BindingFormatType::Sampler(sampler_binding_type), None) => {
+                true // TODO: check for sampler type
+            }, 
+            (Binding::SamplerArray(samplers), BindingFormatType::Sampler(sampler_binding_type), Some(count)) => {
+                count.get() == samplers.len() // TODO: check for sampler type
+            }, 
+            (Binding::TextureView(texture_view), BindingFormatType::Texture { aspect, sample_type, dimension, multisample }, None) => {
+                texture_view.texture().format().sample_type(Some(aspect), Some(System::device().features())) == Some(sample_type) &&
+                texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+            },
+            (Binding::TextureView(texture_view), BindingFormatType::Image { access, format, dimension }, None) => {
+                texture_view.texture().format().remove_srgb_suffix() == format.remove_srgb_suffix() &&
+                texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+            },
+            (Binding::TextureViewArray(texture_views), BindingFormatType::Texture { aspect, sample_type, dimension, multisample }, Some(count)) => {
+                count.get() == texture_views.len() &&
+                texture_views.iter().fold(true, |state, texture_view| {
+                    state &&
+                    texture_view.texture().format().sample_type(Some(aspect), Some(System::device().features())) == Some(sample_type) &&
+                    texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+                })
+            },
+            (Binding::TextureViewArray(texture_views), BindingFormatType::Image { access, format, dimension }, Some(count)) => {
+                count.get() == texture_views.len() &&
+                texture_views.iter().fold(true, |state, texture_view| {
+                    state &&
+                    texture_view.texture().format().remove_srgb_suffix() == format.remove_srgb_suffix() &&
+                    texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+                })
+            },
+            _ => false
+        }
+    }
+
+    pub fn 
+}
+
+pub struct BindingGroup<'a> {
+    format: Arc<BindingGroupFormat>,
+    bindings: Mutex<Box<[Binding<'a>]>>,
+    bindgroup: Mutex<wgpu::BindGroup>
+}
+
+impl<'a> BindingGroup<'a> {
+    pub fn new(format: Arc<BindingGroupFormat>, bindings: &[Binding<'a>]) -> anyhow::Result<Self> {
+        assert_eq!(format.bindings.len(), bindings.len());
+        for (binding, binding_format) in bindings.iter().zip(format.bindings.iter()) {
+            if !binding.verify(&binding_format) {
+                anyhow::bail!("Binding is not compatible with associated format")
+            }
+        }
+        Ok(Self {
+            format: format.clone(),
+            bindings: Mutex::new(bindings.to_vec().into_boxed_slice()),
+            bindgroup: Mutex::new(System::device().create_bind_group(&wgpu::BindGroupDescriptor { 
+                label: (), 
+                layout: &format.layout, 
+                entries: bindings.iter().map(|binding| binding.) 
+            })),
+        })
+    }
+}

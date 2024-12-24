@@ -1,3 +1,5 @@
+use serde::Deserialize;
+
 
 pub enum MaybeBorrowed<'b, B: Sized + 'b> {
     Borrowed(&'b B),

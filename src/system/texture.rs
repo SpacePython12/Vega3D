@@ -5,14 +5,64 @@ use wgpu::util::DeviceExt;
 
 use super::System;
 
+pub struct TextureSampler {
+    sampler: wgpu::Sampler
+}
+
+impl std::borrow::Borrow<wgpu::Sampler> for TextureSampler {
+    fn borrow(&self) -> &wgpu::Sampler {
+        &self.sampler
+    }
+}
+
+impl TextureSampler {
+    pub fn new(
+        wrap_u: wgpu::AddressMode, 
+        wrap_v: wgpu::AddressMode, 
+        wrap_w: wgpu::AddressMode, 
+        mag_filter: wgpu::FilterMode,
+        min_filter: wgpu::FilterMode,
+        mipmap_filter: wgpu::FilterMode,
+        lod_min_clamp: f32,
+        lod_max_clamp: f32,
+        compare_fn: Option<wgpu::CompareFunction>,
+        anisotropy_clamp: u16,
+        border_color: Option<wgpu::SamplerBorderColor>
+    ) -> Self {
+        Self {
+            sampler: System::device().create_sampler(&wgpu::SamplerDescriptor {
+                label: None,
+                address_mode_u: wrap_u,
+                address_mode_v: wrap_v,
+                address_mode_w: wrap_w,
+                mag_filter,
+                min_filter,
+                mipmap_filter,
+                lod_min_clamp,
+                lod_max_clamp,
+                compare: compare_fn,
+                anisotropy_clamp,
+                border_color,
+            })
+        }
+    }
+}
+
 pub struct TextureView<'a> {
-    texture: &'a wgpu::Texture,
+    texture: &'a Texture<'a>,
     texture_view: wgpu::TextureView,
 }
+
 
 impl<'a> std::borrow::Borrow<wgpu::TextureView> for TextureView<'a> {
     fn borrow(&self) -> &wgpu::TextureView {
         &self.texture_view
+    }
+}
+
+impl<'a> TextureView<'a> {
+    pub fn texture(&self) -> &'a Texture<'a> {
+        self.texture
     }
 }
 
@@ -119,7 +169,7 @@ impl<'a> Texture<'a> {
         assert!(base_array_layer + array_layer_count <= self.depth_or_array_layers());
 
         TextureView {
-            texture: &self.texture,
+            texture: &self,
             texture_view: self.texture.create_view(&wgpu::TextureViewDescriptor {
                 label: None,
                 format: Some(if srgb {
@@ -150,6 +200,11 @@ impl<'a> Texture<'a> {
     #[inline]
     pub fn depth_or_array_layers(&self) -> usize {
         self.texture.depth_or_array_layers() as usize
+    }
+
+    #[inline]
+    pub fn size(&self) -> (usize, usize, usize) {
+        (self.width(), self.height(), self.depth_or_array_layers())
     }
 
     #[inline]
