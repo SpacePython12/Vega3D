@@ -12,10 +12,10 @@ use wgpu::util::DeviceExt;
 use super::BinaryData;
 
 pub struct BufferSlice<'a, T: ?Sized> {
-    buffer: &'a wgpu::Buffer,
-    offset: u64,
-    size: NonZero<u64>,
-    mapped: Arc<(Mutex<(Option<wgpu::MapMode>, bool)>, Condvar)>,
+    pub(super) buffer: &'a wgpu::Buffer,
+    pub(super) offset: u64,
+    pub(super) size: NonZero<u64>,
+    pub(super) mapped: Arc<(Mutex<(Option<wgpu::MapMode>, bool)>, Condvar)>,
     phantom: PhantomData<&'a mut T>
 }
 
@@ -52,6 +52,15 @@ impl<'a, T: ?Sized> BufferSlice<'a, T> {
     }
 
     #[inline]
+    pub fn buffer_binding(&self) -> wgpu::BufferBinding<'_> {
+        wgpu::BufferBinding { 
+            buffer: &self.buffer, 
+            offset: self.offset, 
+            size: Some(self.size)
+        }
+    }
+
+    #[inline]
     pub fn offset(&self) -> usize {
         self.offset as usize
     }
@@ -64,12 +73,12 @@ impl<'a, T: ?Sized> BufferSlice<'a, T> {
 
 impl<'a, T: BinaryData> BufferSlice<'a, T> {
     pub fn write(&self, data: &T) {
-        System::queue().write_buffer(&self.buffer, self.offset, bytemuck::bytes_of(data));
+        System::queue().write_buffer(&self.buffer, self.offset, data.to_bytes());
     }
 
     pub fn write_with<F: FnOnce(&mut T)>(&self, callback: F) {
         let mut view = System::queue().write_buffer_with(&self.buffer, self.offset, self.size).unwrap();
-        callback(bytemuck::from_bytes_mut(&mut view));
+        callback(T::from_bytes_mut(&mut view));
     }
 
     pub fn read_mapped<F: FnOnce(&T)>(&self, callback: F) -> anyhow::Result<()> {
@@ -79,7 +88,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, T> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Read) => callback(bytemuck::from_bytes(&self.buffer_slice().get_mapped_range())),
+            Some(wgpu::MapMode::Read) => callback(T::from_bytes(&self.buffer_slice().get_mapped_range())),
             Some(wgpu::MapMode::Write) => anyhow::bail!("Cannot read while buffer is writeonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -94,7 +103,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, T> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Read) => callback(bytemuck::from_bytes(&self.buffer_slice().get_mapped_range())),
+            Some(wgpu::MapMode::Read) => callback(T::from_bytes(&self.buffer_slice().get_mapped_range())),
             Some(wgpu::MapMode::Write) => anyhow::bail!("Cannot read while buffer is writeonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -109,7 +118,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, T> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Write) => callback(bytemuck::from_bytes_mut(&mut self.buffer_slice().get_mapped_range_mut())),
+            Some(wgpu::MapMode::Write) => callback(T::from_bytes_mut(&mut self.buffer_slice().get_mapped_range_mut())),
             Some(wgpu::MapMode::Read) => anyhow::bail!("Cannot write while buffer is readonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -124,7 +133,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, T> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Write) => callback(bytemuck::from_bytes_mut(&mut self.buffer_slice().get_mapped_range_mut())),
+            Some(wgpu::MapMode::Write) => callback(T::from_bytes_mut(&mut self.buffer_slice().get_mapped_range_mut())),
             Some(wgpu::MapMode::Read) => anyhow::bail!("Cannot write while buffer is readonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -137,12 +146,12 @@ impl<'a, T: BinaryData> BufferSlice<'a, T> {
 impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
     pub fn write_array(&self, data: &[T]) {
         assert_eq!(self.size.get(), data.len() as u64);
-        System::queue().write_buffer(&self.buffer, self.offset, bytemuck::cast_slice(data));
+        System::queue().write_buffer(&self.buffer, self.offset, T::slice_to_bytes(data));
     }
 
     pub fn write_array_with<F: FnOnce(&mut [T])>(&self, callback: F) {
         let mut view = System::queue().write_buffer_with(&self.buffer, self.offset, self.size).unwrap();
-        callback(bytemuck::cast_slice_mut(&mut view));
+        callback(T::slice_from_bytes_mut(&mut view));
     }
 
     pub fn read_mapped<F: FnOnce(&[T])>(&self, callback: F) -> anyhow::Result<()> {
@@ -152,7 +161,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Read) => callback(bytemuck::cast_slice(&self.buffer_slice().get_mapped_range())),
+            Some(wgpu::MapMode::Read) => callback(T::slice_from_bytes(&self.buffer_slice().get_mapped_range())),
             Some(wgpu::MapMode::Write) => anyhow::bail!("Cannot read while buffer is writeonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -167,7 +176,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Read) => callback(bytemuck::cast_slice(&self.buffer_slice().get_mapped_range())),
+            Some(wgpu::MapMode::Read) => callback(T::slice_from_bytes(&self.buffer_slice().get_mapped_range())),
             Some(wgpu::MapMode::Write) => anyhow::bail!("Cannot read while buffer is writeonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -182,7 +191,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Write) => callback(bytemuck::cast_slice_mut(&mut self.buffer_slice().get_mapped_range_mut())),
+            Some(wgpu::MapMode::Write) => callback(T::slice_from_bytes_mut(&mut self.buffer_slice().get_mapped_range_mut())),
             Some(wgpu::MapMode::Read) => anyhow::bail!("Cannot write while buffer is readonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -197,7 +206,7 @@ impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
         }
 
         match state_lock.0 {
-            Some(wgpu::MapMode::Write) => callback(bytemuck::cast_slice_mut(&mut self.buffer_slice().get_mapped_range_mut())),
+            Some(wgpu::MapMode::Write) => callback(T::slice_from_bytes_mut(&mut self.buffer_slice().get_mapped_range_mut())),
             Some(wgpu::MapMode::Read) => anyhow::bail!("Cannot write while buffer is readonly mapped."),
             None => anyhow::bail!("There was an error while mapping the buffer."),
         }
@@ -207,18 +216,12 @@ impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
 }
 
 pub struct Buffer<'a, T: ?Sized> {
-    buffer: util::MaybeBorrowed<'a, wgpu::Buffer>,
-    mapped: Arc<(Mutex<(Option<wgpu::MapMode>, bool)>, Condvar)>,
+    pub(super) buffer: util::MaybeBorrowed<'a, wgpu::Buffer>,
+    pub(super) mapped: Arc<(Mutex<(Option<wgpu::MapMode>, bool)>, Condvar)>,
     phantom: PhantomData<&'a mut T>,
 }
 
 pub type ByteBuffer<'a> = Buffer<'a, [u8]>;
-
-impl<'a, T: ?Sized> std::borrow::Borrow<wgpu::Buffer> for Buffer<'a, T> {
-    fn borrow(&self) -> &wgpu::Buffer {
-        &self.buffer
-    }
-}
 
 impl<'a, T: ?Sized> Buffer<'a, T> {
     #[inline]
@@ -299,8 +302,6 @@ impl<'a, T: ?Sized> Buffer<'a, T> {
         Ok(())
     }
 
-
-
     pub fn unmap(&self) {
         *self.mapped.0.lock() = (None, false);
         self.buffer.unmap();
@@ -327,7 +328,7 @@ impl<T: BinaryData> Buffer<'static, T> {
         Self {
             buffer: util::MaybeBorrowed::Owned(System::device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: bytemuck::bytes_of(data),
+                contents: data.to_bytes(),
                 usage,
             })),
             mapped: Arc::new((Mutex::new((None, false)), Condvar::new())),
@@ -374,12 +375,13 @@ impl<T: BinaryData> Buffer<'static, [T]> {
             phantom: PhantomData
         }
     }
+
     #[inline]
     pub fn new_array_init(usage: wgpu::BufferUsages, data: &[T]) -> Self {
         Self {
             buffer: util::MaybeBorrowed::Owned(System::device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: bytemuck::cast_slice(data),
+                contents: T::slice_to_bytes(data),
                 usage,
             })),
             mapped: Arc::new((Mutex::new((None, false)), Condvar::new())),

@@ -4,9 +4,63 @@ pub mod buffer;
 pub mod texture;
 pub mod pipeline;
 
-pub trait BinaryData: Sized + Clone + Copy + bytemuck::Pod + bytemuck::NoUninit + bytemuck::AnyBitPattern {}
+pub trait BinaryData: Sized + Clone + Copy {
+    fn from_bytes(bytes: &[u8]) -> &Self {
+        assert_eq!(bytes.as_ptr().align_offset(std::mem::align_of::<Self>()), 0);
+        assert_eq!(bytes.len(), std::mem::size_of::<Self>());
+        unsafe { std::mem::transmute(bytes.as_ptr()) }
+    }
+    fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self {
+        assert_eq!(bytes.as_ptr().align_offset(std::mem::align_of::<Self>()), 0);
+        assert_eq!(bytes.len(), std::mem::size_of::<Self>());
+        unsafe { std::mem::transmute(bytes.as_mut_ptr()) }
+    }
+    fn slice_from_bytes(bytes: &[u8]) -> &[Self] {
+        assert_eq!(bytes.as_ptr().align_offset(std::mem::align_of::<Self>()), 0);
+        assert_eq!(bytes.len() % std::mem::size_of::<Self>(), 0);
+        unsafe { std::slice::from_raw_parts(
+            std::mem::transmute(bytes.as_ptr()),
+            bytes.len() / std::mem::size_of::<Self>()
+        ) }
+    }
+    fn slice_from_bytes_mut(bytes: &mut [u8]) -> &mut [Self] {
+        assert_eq!(bytes.as_ptr().align_offset(std::mem::align_of::<Self>()), 0);
+        assert_eq!(bytes.len() % std::mem::size_of::<Self>(), 0);
+        unsafe { std::slice::from_raw_parts_mut(
+            std::mem::transmute(bytes.as_mut_ptr()),
+            bytes.len() / std::mem::size_of::<Self>()
+        ) }
+    }
+    fn to_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(
+            std::mem::transmute(self),
+            std::mem::size_of::<Self>()
+        ) }
+    }
+    fn to_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(
+            std::mem::transmute(self),
+            std::mem::size_of::<Self>()
+        ) }
+    }
+    fn slice_to_bytes(slice: &[Self]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(
+            std::mem::transmute(slice.as_ptr()),
+            slice.len() * std::mem::size_of::<Self>()
+        ) }
+    }
+    fn slice_to_bytes_mut(slice: &mut [Self]) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(
+            std::mem::transmute(slice.as_mut_ptr()),
+            slice.len() * std::mem::size_of::<Self>()
+        ) }
+    }
+}
 
-impl<T: Sized + Clone + Copy + bytemuck::Pod + bytemuck::NoUninit + bytemuck::AnyBitPattern> BinaryData for T {}
+// impl BinaryData for wgpu::util::DrawIndirectArgs {}
+// impl BinaryData for wgpu::util::DrawIndexedIndirectArgs {}
+
+impl<T: Sized + Clone + Copy + bytemuck::Pod + bytemuck::AnyBitPattern> BinaryData for T {}
 
 use std::sync::{Arc, OnceLock};
 use parking_lot::*;
@@ -14,10 +68,6 @@ use std::collections::HashMap;
 
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GamepadId(pub(self) gilrs::GamepadId);
 
 pub trait GameHandler: Send + Sync + 'static {
     fn init(&mut self, event_loop: &mut EventLoop<'_>) -> anyhow::Result<()>;
@@ -72,27 +122,27 @@ pub trait GameHandler: Send + Sync + 'static {
         Ok(())
     }
 
-    fn on_gamepad_connected(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: GamepadId)  -> anyhow::Result<()> {
+    fn on_gamepad_connected(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: bindings::GamepadId)  -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn on_gamepad_disconnected(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: GamepadId)  -> anyhow::Result<()> {
+    fn on_gamepad_disconnected(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: bindings::GamepadId)  -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn on_gamepad_button_pressed(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: GamepadId, button: bindings::Button)  -> anyhow::Result<()> {
+    fn on_gamepad_button_pressed(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: bindings::GamepadId, button: bindings::Button)  -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn on_gamepad_button_released(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: GamepadId, button: bindings::Button)  -> anyhow::Result<()> {
+    fn on_gamepad_button_released(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: bindings::GamepadId, button: bindings::Button)  -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn on_gamepad_button_changed(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: GamepadId, button: bindings::Button, value: f32)  -> anyhow::Result<()> {
+    fn on_gamepad_button_changed(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: bindings::GamepadId, button: bindings::Button, value: f32)  -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn on_gamepad_axis_changed(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: GamepadId, axis: bindings::Axis, value: f32)  -> anyhow::Result<()> {
+    fn on_gamepad_axis_changed(&mut self, event_loop: &mut EventLoop<'_>, gamepad_id: bindings::GamepadId, axis: bindings::Axis, value: f32)  -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -269,11 +319,15 @@ impl System {
         lock.get(name).cloned()
     }
 
-    pub fn queue() -> &'static Arc<wgpu::Queue> {
+    pub fn flush_all() {
+        Self::queue().submit(None);
+    }
+
+    pub(self) fn queue() -> &'static Arc<wgpu::Queue> {
         &Self::this().queue
     }
 
-    pub fn device() -> &'static Arc<wgpu::Device> {
+    pub(self) fn device() -> &'static Arc<wgpu::Device> {
         &Self::this().device
     }
 }
@@ -465,7 +519,7 @@ impl winit::application::ApplicationHandler<gilrs::Event> for SystemEventHandler
             } else { 0.0 }
         }
 
-        let gamepad_id = GamepadId(event.id);
+        let gamepad_id = bindings::GamepadId(event.id);
         let handler = self.handler.clone();
         let mut system = EventLoop(event_loop);
 

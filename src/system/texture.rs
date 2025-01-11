@@ -1,21 +1,53 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use crate::util;
 use wgpu::util::DeviceExt;
 
 use super::System;
 
-pub struct TextureSampler {
-    sampler: wgpu::Sampler
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Origin3d {
+    pub x: usize,
+    pub y: usize,
+    pub z: usize
 }
 
-impl std::borrow::Borrow<wgpu::Sampler> for TextureSampler {
-    fn borrow(&self) -> &wgpu::Sampler {
-        &self.sampler
+impl Origin3d {
+    pub const ZERO: Self = Self { x: 0, y: 0, z: 0 };
+}
+
+impl Into<wgpu::Origin3d> for Origin3d {
+    fn into(self) -> wgpu::Origin3d {
+        wgpu::Origin3d { x: self.x as u32, y: self.y as u32, z: self.z as u32 }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Extent3d {
+    pub width: usize,
+    pub height: usize,
+    pub depth_or_array_layers: usize
+}
+
+impl From<wgpu::Extent3d> for Extent3d {
+    fn from(value: wgpu::Extent3d) -> Self {
+        Self { width: value.width as usize, height: value.height as usize, depth_or_array_layers: value.depth_or_array_layers as usize }
+    }
+}
+
+impl Into<wgpu::Extent3d> for Extent3d {
+    fn into(self) -> wgpu::Extent3d {
+        wgpu::Extent3d { width: self.width as u32, height: self.height as u32, depth_or_array_layers: self.depth_or_array_layers as u32 }
+    }
+}
+
+pub struct TextureSampler {
+    pub(super) sampler: wgpu::Sampler,
+    pub(super) desc: wgpu::SamplerDescriptor<'static>
+}
+
 impl TextureSampler {
+    #[inline]
     pub fn new(
         wrap_u: wgpu::AddressMode, 
         wrap_v: wgpu::AddressMode, 
@@ -29,35 +61,31 @@ impl TextureSampler {
         anisotropy_clamp: u16,
         border_color: Option<wgpu::SamplerBorderColor>
     ) -> Self {
+        let desc = wgpu::SamplerDescriptor {
+            label: None,
+            address_mode_u: wrap_u,
+            address_mode_v: wrap_v,
+            address_mode_w: wrap_w,
+            mag_filter,
+            min_filter,
+            mipmap_filter,
+            lod_min_clamp,
+            lod_max_clamp,
+            compare: compare_fn,
+            anisotropy_clamp,
+            border_color,
+        };
         Self {
-            sampler: System::device().create_sampler(&wgpu::SamplerDescriptor {
-                label: None,
-                address_mode_u: wrap_u,
-                address_mode_v: wrap_v,
-                address_mode_w: wrap_w,
-                mag_filter,
-                min_filter,
-                mipmap_filter,
-                lod_min_clamp,
-                lod_max_clamp,
-                compare: compare_fn,
-                anisotropy_clamp,
-                border_color,
-            })
+            sampler: System::device().create_sampler(&desc),
+            desc
         }
     }
 }
 
 pub struct TextureView<'a> {
-    texture: &'a Texture<'a>,
-    texture_view: wgpu::TextureView,
-}
-
-
-impl<'a> std::borrow::Borrow<wgpu::TextureView> for TextureView<'a> {
-    fn borrow(&self) -> &wgpu::TextureView {
-        &self.texture_view
-    }
+    pub(super) texture: &'a Texture<'a>,
+    pub(super) texture_view: wgpu::TextureView,
+    pub(super) desc: wgpu::TextureViewDescriptor<'static>
 }
 
 impl<'a> TextureView<'a> {
@@ -66,15 +94,73 @@ impl<'a> TextureView<'a> {
     }
 }
 
-pub struct Texture<'a> {
-    texture: util::MaybeBorrowed<'a, wgpu::Texture>,
-    phantom: PhantomData<&'a [u8]>
+pub struct SubTexture<'a> {
+    pub(super) texture: &'a wgpu::Texture,
+    pub(super) origin: wgpu::Origin3d,
+    pub(super) size: wgpu::Extent3d,
+    pub(super) mip_level: u32,
+    pub(super) aspect: wgpu::TextureAspect
 }
 
-impl<'a> std::borrow::Borrow<wgpu::Texture> for Texture<'a> {
-    fn borrow(&self) -> &wgpu::Texture {
-        &self.texture
+impl<'a> SubTexture<'a> {
+    pub(super) fn texel_copy_size(&self) -> Option<u32> {
+        self.format().block_copy_size(Some(self.aspect))
     }
+
+    pub(super) fn texel_dimensions(&self) -> (u32, u32) {
+        self.format().block_dimensions()
+    }
+
+    pub(super) fn image_data_layout(&self, offset: u64) -> Option<wgpu::ImageDataLayout> {
+        self.texel_copy_size().map(|block_copy_size| {
+            let (w, h) = self.texel_dimensions();
+            wgpu::ImageDataLayout { 
+                offset, 
+                bytes_per_row: Some((self.size.width / w) * block_copy_size), 
+                rows_per_image: Some(self.size.height / h)
+            }
+        })
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.texture.format().aspect_specific_format(self.aspect).unwrap_or_else(|| self.texture.format())
+    }
+
+    pub fn total_size(&self) -> Option<usize> {
+        self.texel_copy_size().map(|block_copy_size| {
+            let (w, h) = self.texel_dimensions();
+            ((self.size.width / w) as usize) * 
+            ((self.size.height / h) as usize) * 
+            (self.size.depth_or_array_layers as usize) * 
+            (block_copy_size as usize)
+        })
+    }
+
+    pub(super) fn image_copy_texture(&self) -> wgpu::ImageCopyTexture<'a> {
+        wgpu::ImageCopyTextureBase { 
+            texture: &self.texture, 
+            mip_level: self.mip_level, 
+            origin: self.origin, 
+            aspect: self.aspect 
+        }
+    }
+
+
+
+    pub fn write(&self, data: &[u8]) -> anyhow::Result<()> {
+        System::queue().write_texture(
+            self.image_copy_texture(), 
+            data, 
+            self.image_data_layout(0).ok_or_else(|| anyhow::anyhow!("This texture has a format that cannot be written to!"))?, 
+            self.size
+        );
+        Ok(())
+    }
+}
+
+pub struct Texture<'a> {
+    pub(super) texture: util::MaybeBorrowed<'a, wgpu::Texture>,
+    phantom: PhantomData<&'a mut [u8]>
 }
 
 impl Texture<'static> {
@@ -135,8 +221,8 @@ impl<'a> Texture<'a> {
         }
     }
 
-    pub fn create_view(&self, srgb: bool, dimension: Option<wgpu::TextureViewDimension>, aspect: wgpu::TextureAspect, mip_range: impl std::ops::RangeBounds<usize>, layer_range: impl std::ops::RangeBounds<usize>) -> TextureView<'_> {
-        let base_mip_level = match mip_range.start_bound() {
+    pub fn create_view(&self, srgb: bool, dimension: Option<wgpu::TextureViewDimension>, aspect: wgpu::TextureAspect, mip_levels: impl std::ops::RangeBounds<usize>, array_layers: impl std::ops::RangeBounds<usize>) -> TextureView<'_> {
+        let base_mip_level = match mip_levels.start_bound() {
             std::ops::Bound::Included(val) => *val,
             std::ops::Bound::Excluded(val) => *val + 1,
             std::ops::Bound::Unbounded => 0,
@@ -144,7 +230,7 @@ impl<'a> Texture<'a> {
 
         assert!(base_mip_level < self.mip_level_count());
 
-        let mip_level_count = match mip_range.end_bound() {
+        let mip_level_count = match mip_levels.end_bound() {
             std::ops::Bound::Included(val) => *val - base_mip_level + 1,
             std::ops::Bound::Excluded(val) => *val - base_mip_level,
             std::ops::Bound::Unbounded => self.mip_level_count() - base_mip_level,
@@ -152,7 +238,7 @@ impl<'a> Texture<'a> {
 
         assert!(base_mip_level + mip_level_count <= self.mip_level_count());
         
-        let base_array_layer = match layer_range.start_bound() {
+        let base_array_layer = match array_layers.start_bound() {
             std::ops::Bound::Included(val) => *val,
             std::ops::Bound::Excluded(val) => *val + 1,
             std::ops::Bound::Unbounded => 0,
@@ -160,30 +246,32 @@ impl<'a> Texture<'a> {
 
         assert!(base_array_layer < self.depth_or_array_layers());
 
-        let array_layer_count = match layer_range.end_bound() {
+        let array_layer_count = match array_layers.end_bound() {
             std::ops::Bound::Included(val) => *val - base_array_layer + 1,
             std::ops::Bound::Excluded(val) => *val - base_array_layer,
             std::ops::Bound::Unbounded => self.mip_level_count() - base_array_layer,
         };
 
         assert!(base_array_layer + array_layer_count <= self.depth_or_array_layers());
-
+        
+        let desc = wgpu::TextureViewDescriptor {
+            label: None,
+            format: Some(if srgb {
+                self.format().add_srgb_suffix()
+            } else {
+                self.format().remove_srgb_suffix()
+            }),
+            dimension,
+            aspect,
+            base_mip_level: base_mip_level as u32,
+            mip_level_count: Some(mip_level_count as u32),
+            base_array_layer: base_array_layer as u32,
+            array_layer_count: Some(array_layer_count as u32),
+        };
         TextureView {
             texture: &self,
-            texture_view: self.texture.create_view(&wgpu::TextureViewDescriptor {
-                label: None,
-                format: Some(if srgb {
-                    self.format().add_srgb_suffix()
-                } else {
-                    self.format().remove_srgb_suffix()
-                }),
-                dimension,
-                aspect,
-                base_mip_level: base_mip_level as u32,
-                mip_level_count: Some(mip_level_count as u32),
-                base_array_layer: base_array_layer as u32,
-                array_layer_count: Some(array_layer_count as u32),
-            }),
+            texture_view: self.texture.create_view(&desc),
+            desc
         }
     }
 
@@ -203,8 +291,8 @@ impl<'a> Texture<'a> {
     }
 
     #[inline]
-    pub fn size(&self) -> (usize, usize, usize) {
-        (self.width(), self.height(), self.depth_or_array_layers())
+    pub fn size(&self) -> Extent3d {
+        self.texture.size().into()
     }
 
     #[inline]
@@ -232,37 +320,14 @@ impl<'a> Texture<'a> {
         self.texture.usage()
     }
 
-    pub fn write(&self, origin: (usize, usize, usize), size: (usize, usize, usize), mip_level: usize, aspect: wgpu::TextureAspect, data: &[u8]) -> anyhow::Result<()> {
-        let pix_size = self.format().block_copy_size(Some(aspect)).expect("This texture has a format that cannot be written to!");
-        
-        let origin = wgpu::Origin3d {
-            x: origin.0 as u32,
-            y: origin.1 as u32,
-            z: origin.2 as u32,
-        };
-
-        let size = wgpu::Extent3d {
-            width: size.0 as u32,
-            height: size.1 as u32,
-            depth_or_array_layers: size.2 as u32,
-        };
-
-        System::queue().write_texture(
-            wgpu::ImageCopyTextureBase { 
-                texture: &self.texture, 
-                mip_level: mip_level as u32, 
-                origin, 
-                aspect 
-            }, 
-            data, 
-            wgpu::ImageDataLayout { 
-                offset: 0, 
-                bytes_per_row: Some(size.width * pix_size), 
-                rows_per_image: Some(size.height * size.width * pix_size)
-            }, 
-            size
-        );
-
-        Ok(())
+    #[inline]
+    pub fn sub_texture(&self, origin: Origin3d, size: Extent3d, mip_level: usize, aspect: wgpu::TextureAspect) -> SubTexture<'_> {
+        SubTexture { 
+            texture: &self.texture, 
+            origin: origin.into(), 
+            size: size.into(), 
+            mip_level: mip_level as u32, 
+            aspect 
+        }
     }
 }

@@ -1,3 +1,5 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GamepadId(pub(super) gilrs::GamepadId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
