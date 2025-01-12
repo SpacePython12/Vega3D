@@ -12,11 +12,11 @@ use wgpu::util::DeviceExt;
 use super::BinaryData;
 
 pub struct BufferSlice<'a, T: ?Sized> {
-    pub(super) buffer: &'a wgpu::Buffer,
+    pub(super) buffer: Arc<wgpu::Buffer>,
     pub(super) offset: u64,
     pub(super) size: NonZero<u64>,
     pub(super) mapped: Arc<(Mutex<(Option<wgpu::MapMode>, bool)>, Condvar)>,
-    phantom: PhantomData<&'a mut T>
+    phantom: PhantomData<&'a Buffer<T>>
 }
 
 pub type ByteBufferSlice<'a> = BufferSlice<'a, [u8]>;
@@ -26,7 +26,7 @@ impl<'a, T: ?Sized> BufferSlice<'a, T> {
     pub fn cast_to<U: BinaryData>(self) -> BufferSlice<'a, U> {
         assert_eq!(self.size(), size_of::<U>());
         BufferSlice {
-            buffer: &self.buffer,
+            buffer: self.buffer.clone(),
             offset: self.offset,
             size: self.size,
             mapped: self.mapped,
@@ -38,7 +38,7 @@ impl<'a, T: ?Sized> BufferSlice<'a, T> {
     pub fn cast_to_array<U: BinaryData>(self) -> BufferSlice<'a, [U]> {
         assert_eq!(self.size() % size_of::<U>(), 0);
         BufferSlice {
-            buffer: &self.buffer,
+            buffer: self.buffer.clone(),
             offset: self.offset,
             size: self.size,
             mapped: self.mapped,
@@ -215,15 +215,15 @@ impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
     }
 }
 
-pub struct Buffer<'a, T: ?Sized> {
-    pub(super) buffer: util::MaybeBorrowed<'a, wgpu::Buffer>,
+pub struct Buffer<T: ?Sized> {
+    pub(super) buffer: Arc<wgpu::Buffer>,
     pub(super) mapped: Arc<(Mutex<(Option<wgpu::MapMode>, bool)>, Condvar)>,
-    phantom: PhantomData<&'a mut T>,
+    phantom: PhantomData<T>,
 }
 
-pub type ByteBuffer<'a> = Buffer<'a, [u8]>;
+pub type ByteBuffer = Buffer<[u8]>;
 
-impl<'a, T: ?Sized> Buffer<'a, T> {
+impl<T: ?Sized> Buffer<T> {
     #[inline]
     pub fn usages(&self) -> wgpu::BufferUsages {
         self.buffer.usage()
@@ -235,20 +235,20 @@ impl<'a, T: ?Sized> Buffer<'a, T> {
     }
 
     #[inline]
-    pub fn cast_to<'b, U: BinaryData>(&'b self) -> Buffer<'b, U> {
+    pub fn cast_to<U: BinaryData>(&self) -> Buffer<U> {
         assert_eq!(self.size(), size_of::<U>());
         Buffer {
-            buffer: util::MaybeBorrowed::Borrowed(&self.buffer),
+            buffer: self.buffer.clone(),
             mapped: self.mapped.clone(),
             phantom: PhantomData,
         }
     }
 
     #[inline]
-    pub fn cast_to_array<'b: 'a, U: BinaryData>(&'b self) -> Buffer<'b, [U]> {
+    pub fn cast_to_array<U: BinaryData>(&self) -> Buffer<[U]> {
         assert_eq!(self.size() % size_of::<U>(), 0);
         Buffer {
-            buffer: util::MaybeBorrowed::Borrowed(&self.buffer),
+            buffer: self.buffer.clone(),
             mapped: self.mapped.clone(),
             phantom: PhantomData,
         }
@@ -308,16 +308,16 @@ impl<'a, T: ?Sized> Buffer<'a, T> {
     }
 }
 
-impl<T: BinaryData> Buffer<'static, T> {
+impl<T: BinaryData> Buffer<T> {
     #[inline]
     pub fn new_uninit(usage: wgpu::BufferUsages, mapped_at_creation: bool) -> Self {
         Self {
-            buffer: util::MaybeBorrowed::Owned(System::device().create_buffer(&wgpu::BufferDescriptor {
+            buffer: System::device().create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: size_of::<T>() as u64,
                 usage,
                 mapped_at_creation,
-            })),
+            }).into(),
             mapped: Arc::new((Mutex::new((None, false)), Condvar::new())),
             phantom: PhantomData
         }
@@ -326,33 +326,20 @@ impl<T: BinaryData> Buffer<'static, T> {
     #[inline]
     pub fn new_init(usage: wgpu::BufferUsages, data: &T) -> Self {
         Self {
-            buffer: util::MaybeBorrowed::Owned(System::device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            buffer: System::device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: data.to_bytes(),
                 usage,
-            })),
+            }).into(),
             mapped: Arc::new((Mutex::new((None, false)), Condvar::new())),
             phantom: PhantomData
-        }
-    }
-}
-
-impl<'a, T: BinaryData> Buffer<'a, T> {
-    #[inline]
-    pub fn new_with<Buf: Into<util::MaybeBorrowed<'a, wgpu::Buffer>>>(buffer: Buf, mapped: Option<wgpu::MapMode>) -> Self {
-        let buffer: util::MaybeBorrowed<'a, wgpu::Buffer> = buffer.into();
-        assert_eq!(buffer.size() as usize, size_of::<T>());
-        Self {
-            buffer,
-            mapped: Arc::new((Mutex::new((mapped, true)), Condvar::new())),
-            phantom: PhantomData,
         }
     }
 
     #[inline]
     pub fn buffer_slice(&self) -> BufferSlice<'_, T> {
         BufferSlice {
-            buffer: &self.buffer,
+            buffer: self.buffer.clone(),
             offset: 0,
             size: NonZero::new(size_of::<T>() as u64).unwrap(),
             mapped: self.mapped.clone(),
@@ -361,16 +348,16 @@ impl<'a, T: BinaryData> Buffer<'a, T> {
     }
 }
 
-impl<T: BinaryData> Buffer<'static, [T]> {
+impl<T: BinaryData> Buffer<[T]> {
     #[inline]
     pub fn new_array_uninit(usage: wgpu::BufferUsages, mapped_at_creation: bool, length: usize) -> Self {
         Self {
-            buffer: util::MaybeBorrowed::Owned(System::device().create_buffer(&wgpu::BufferDescriptor {
+            buffer: System::device().create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: (size_of::<T>() * length) as u64,
                 usage,
                 mapped_at_creation,
-            })),
+            }).into(),
             mapped: Arc::new((Mutex::new((None, false)), Condvar::new())),
             phantom: PhantomData
         }
@@ -379,26 +366,13 @@ impl<T: BinaryData> Buffer<'static, [T]> {
     #[inline]
     pub fn new_array_init(usage: wgpu::BufferUsages, data: &[T]) -> Self {
         Self {
-            buffer: util::MaybeBorrowed::Owned(System::device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            buffer: System::device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: T::slice_to_bytes(data),
                 usage,
-            })),
+            }).into(),
             mapped: Arc::new((Mutex::new((None, false)), Condvar::new())),
             phantom: PhantomData
-        }
-    }
-}
-
-impl<'a, T: BinaryData> Buffer<'a, [T]> {
-    #[inline]
-    pub fn new_array_with<Buf: Into<util::MaybeBorrowed<'a, wgpu::Buffer>>>(buffer: Buf, mapped: Option<wgpu::MapMode>) -> Self {
-        let buffer: util::MaybeBorrowed<'a, wgpu::Buffer> = buffer.into();
-        assert_eq!(buffer.size() as usize % size_of::<T>(), 0);
-        Buffer {
-            buffer,
-            mapped: Arc::new((Mutex::new((mapped, mapped.is_some())), Condvar::new())),
-            phantom: PhantomData,
         }
     }
 
@@ -426,7 +400,7 @@ impl<'a, T: BinaryData> Buffer<'a, [T]> {
         assert!(offset + length <= self.len());
 
         BufferSlice {
-            buffer: &self.buffer,
+            buffer: self.buffer.clone(),
             offset: (size_of::<T>() * offset) as u64,
             size: NonZero::new((size_of::<T>() * length) as u64).unwrap(),
             mapped: self.mapped.clone(),

@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::{Arc, Weak}};
 
 use crate::util;
 use wgpu::util::DeviceExt;
@@ -42,7 +42,7 @@ impl Into<wgpu::Extent3d> for Extent3d {
 }
 
 pub struct TextureSampler {
-    pub(super) sampler: wgpu::Sampler,
+    pub(super) sampler: Arc<wgpu::Sampler>,
     pub(super) desc: wgpu::SamplerDescriptor<'static>
 }
 
@@ -76,30 +76,50 @@ impl TextureSampler {
             border_color,
         };
         Self {
-            sampler: System::device().create_sampler(&desc),
+            sampler: System::device().create_sampler(&desc).into(),
             desc
         }
     }
 }
 
 pub struct TextureView<'a> {
-    pub(super) texture: &'a Texture<'a>,
-    pub(super) texture_view: wgpu::TextureView,
-    pub(super) desc: wgpu::TextureViewDescriptor<'static>
+    pub(super) texture: Option<Arc<wgpu::Texture>>,
+    pub(super) texture_view: Arc<wgpu::TextureView>,
+    pub(super) desc: wgpu::TextureViewDescriptor<'static>,
+    phantom: PhantomData<&'a Texture>
 }
 
 impl<'a> TextureView<'a> {
-    pub fn texture(&self) -> &'a Texture<'a> {
-        self.texture
+    pub fn format(&self) -> Option<wgpu::TextureFormat> {
+        self.desc.format.or_else(|| self.texture.as_ref().map(|texture| 
+            texture.format().aspect_specific_format(self.desc.aspect).unwrap_or(texture.format())
+        ))
+    }
+
+    pub fn dimension(&self) -> Option<wgpu::TextureViewDimension> {
+        self.desc.dimension.or_else(|| self.texture.as_ref().map(|texture| {
+            match texture.dimension() {
+                wgpu::TextureDimension::D1 => wgpu::TextureViewDimension::D1,
+                wgpu::TextureDimension::D2 => {
+                    if texture.depth_or_array_layers() == 1 {
+                        wgpu::TextureViewDimension::D2
+                    } else {
+                        wgpu::TextureViewDimension::D2Array
+                    }
+                }
+                wgpu::TextureDimension::D3 => wgpu::TextureViewDimension::D3,
+            }
+        }))
     }
 }
 
 pub struct SubTexture<'a> {
-    pub(super) texture: &'a wgpu::Texture,
+    pub(super) texture: Arc<wgpu::Texture>,
     pub(super) origin: wgpu::Origin3d,
     pub(super) size: wgpu::Extent3d,
     pub(super) mip_level: u32,
-    pub(super) aspect: wgpu::TextureAspect
+    pub(super) aspect: wgpu::TextureAspect,
+    phantom: PhantomData<&'a Texture>
 }
 
 impl<'a> SubTexture<'a> {
@@ -136,7 +156,7 @@ impl<'a> SubTexture<'a> {
         })
     }
 
-    pub(super) fn image_copy_texture(&self) -> wgpu::ImageCopyTexture<'a> {
+    pub(super) fn image_copy_texture(&self) -> wgpu::ImageCopyTexture<'_> {
         wgpu::ImageCopyTextureBase { 
             texture: &self.texture, 
             mip_level: self.mip_level, 
@@ -158,16 +178,16 @@ impl<'a> SubTexture<'a> {
     }
 }
 
-pub struct Texture<'a> {
-    pub(super) texture: util::MaybeBorrowed<'a, wgpu::Texture>,
-    phantom: PhantomData<&'a mut [u8]>
+pub struct Texture {
+    pub(super) texture: Arc<wgpu::Texture>,
+    // phantom: PhantomData<[u8]> // redundant
 }
 
-impl Texture<'static> {
+impl Texture {
     #[inline]
     pub fn new_uninit(usages: wgpu::TextureUsages, format: wgpu::TextureFormat, dimension: wgpu::TextureDimension, size: wgpu::Extent3d, mip_levels: usize, sample_count: usize) -> Self {
         Self {
-            texture: util::MaybeBorrowed::Owned(System::device().create_texture(&wgpu::TextureDescriptor {
+            texture: System::device().create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size,
                 mip_level_count: mip_levels as u32,
@@ -180,15 +200,15 @@ impl Texture<'static> {
                 } else {
                     format.add_srgb_suffix()
                 }],
-            })),
-            phantom: PhantomData,
+            }).into(),
+            // phantom: PhantomData,
         }
     }
 
     #[inline]
     pub fn new_init(usages: wgpu::TextureUsages, format: wgpu::TextureFormat, dimension: wgpu::TextureDimension, size: wgpu::Extent3d, mip_levels: usize, sample_count: usize, order: wgpu::util::TextureDataOrder, data: &[u8]) -> Self {
         Self {
-            texture: util::MaybeBorrowed::Owned(System::device().create_texture_with_data(
+            texture: System::device().create_texture_with_data(
                 &System::queue(),
                 &wgpu::TextureDescriptor {
                     label: None,
@@ -206,22 +226,12 @@ impl Texture<'static> {
                 },
                 order,
                 data
-            )),
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<'a> Texture<'a> {
-    #[inline]
-    pub fn new_with<Tex: Into<util::MaybeBorrowed<'a, wgpu::Texture>>>(texture: Tex) -> Self {
-        Self {
-            texture: texture.into(),
-            phantom: PhantomData
+            ).into(),
+            // phantom: PhantomData,
         }
     }
 
-    pub fn create_view(&self, srgb: bool, dimension: Option<wgpu::TextureViewDimension>, aspect: wgpu::TextureAspect, mip_levels: impl std::ops::RangeBounds<usize>, array_layers: impl std::ops::RangeBounds<usize>) -> TextureView<'_> {
+    pub fn create_view(&self, srgb: bool, dimension: Option<wgpu::TextureViewDimension>, aspect: wgpu::TextureAspect, mip_levels: impl std::ops::RangeBounds<usize>, array_layers: impl std::ops::RangeBounds<usize>) -> anyhow::Result<TextureView<'_>> {
         let base_mip_level = match mip_levels.start_bound() {
             std::ops::Bound::Included(val) => *val,
             std::ops::Bound::Excluded(val) => *val + 1,
@@ -268,11 +278,12 @@ impl<'a> Texture<'a> {
             base_array_layer: base_array_layer as u32,
             array_layer_count: Some(array_layer_count as u32),
         };
-        TextureView {
-            texture: &self,
-            texture_view: self.texture.create_view(&desc),
-            desc
-        }
+        Ok(TextureView {
+            texture: Some(self.texture.clone()),
+            texture_view: self.texture.create_view(&desc).into(),
+            desc,
+            phantom: PhantomData
+        })
     }
 
     #[inline]
@@ -323,11 +334,12 @@ impl<'a> Texture<'a> {
     #[inline]
     pub fn sub_texture(&self, origin: Origin3d, size: Extent3d, mip_level: usize, aspect: wgpu::TextureAspect) -> SubTexture<'_> {
         SubTexture { 
-            texture: &self.texture, 
+            texture: self.texture.clone(), 
             origin: origin.into(), 
             size: size.into(), 
             mip_level: mip_level as u32, 
-            aspect 
+            aspect,
+            phantom: PhantomData
         }
     }
 }

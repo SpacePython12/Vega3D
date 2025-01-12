@@ -416,7 +416,7 @@ impl CommandEncoder {
             }
         }).collect::<Vec<_>>();
         let render_pass = RenderPass {
-            pass: Mutex::new(self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            pass: self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &color_attachments,
                 depth_stencil_attachment: depth_stencil_attachment.map(|(texture_view, depth_ops, stencil_ops)| {
@@ -446,7 +446,7 @@ impl CommandEncoder {
                     }
                 }),
                 occlusion_query_set: occlusion_query_set.map(|query_set| &query_set.query_set),
-            }))
+            })
         };
         f(&render_pass)?;
         Ok(())
@@ -575,6 +575,7 @@ impl CommandEncoder {
             wgpu::QueryType::PipelineStatistics(types) => types.iter().fold(0usize, |count, flag| if flag.is_empty() { count + 1 } else { count }),
             wgpu::QueryType::Timestamp => 1usize,
         } * query_range.len();
+
         self.encoder.resolve_query_set(
             &query_set.query_set, 
             query_range, 
@@ -586,11 +587,19 @@ impl CommandEncoder {
 }
 
 pub struct RenderPass<'a> {
-    pub(super) pass: Mutex<wgpu::RenderPass<'a>>
+    pub(super) pass: wgpu::RenderPass<'a>
 }
 
 impl<'a> RenderPass<'a> {
-
+    pub fn set_binding_group<'a>(&'a mut self, index: usize, binding_group: impl Into<Option<&'a BindingGroup<'a>>>) -> anyhow::Result<()> {
+        self.pass.set_bind_group(
+            index as u32, 
+            binding_group.into().map(|binding_group| {
+                binding_group.wgpu_bind_group()
+            }), 
+            offsets
+        );
+    }
 }
 
 pub struct QuerySet {
@@ -618,30 +627,31 @@ impl QuerySet {
     }
 }
 
-pub enum Binding<'a> {
-    Buffer(util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>),
-    BufferArray(&'a [util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>]),
-    Sampler(util::MaybeBorrowed<'a, texture::TextureSampler>),
-    SamplerArray(&'a [util::MaybeBorrowed<'a, texture::TextureSampler>]),
-    TextureView(util::MaybeBorrowed<'a, texture::TextureView<'a>>),
-    TextureViewArray(&'a [util::MaybeBorrowed<'a, texture::TextureView<'a>>]),
+pub enum Binding {
+    Buffer(Arc<wgpu::Buffer>, u64, Option<NonZero<u64>>),
+    BufferArray(Vec<(Arc<wgpu::Buffer>, u64, Option<NonZero<u64>>)>),
+    Sampler(Arc<wgpu::Sampler>),
+    SamplerArray(Vec<Arc<wgpu::Sampler>>),
+    TextureView(Arc<wgpu::TextureView>),
+    TextureViewArray(Vec<Arc<wgpu::TextureView>>),
 }
 
-impl<'a> Binding<'a> {
+impl Binding {
     pub fn verify(&self, format: &BindingFormat) -> bool {
         match (self, format.ty, format.count) {
-            (Binding::Buffer(buffer), BindingFormatType::Uniform { size }, None) => {
-                buffer.size() >= size
+            (Binding::Buffer(buffer, _, _), BindingFormatType::Uniform { size }, None) => {
+                buffer.size() >= size as u64
             },
-            (Binding::Buffer(buffer), BindingFormatType::Buffer { read_only, size }, None) => {
-                !size.is_some_and(|size| buffer.size() < size.get())
+            (Binding::Buffer(buffer, _, _), BindingFormatType::Buffer { read_only, size }, None) => {
+                !size.is_some_and(|size| buffer.size() < size.get() as u64)
             },
             (Binding::BufferArray(buffers), BindingFormatType::Uniform { size }, Some(count)) => {
                 count.get() == buffers.len() && 
-                buffers.iter().fold(true, |state, buffer| state && buffer.size() >= size)
+                buffers.iter().fold(true, |state, (buffer, _, _)| state && buffer.size() >= size as u64)
             },
             (Binding::BufferArray(buffers), BindingFormatType::Buffer { read_only, size }, Some(count)) => {
-                count.get() == buffers.len() && !size.is_some_and(|size| !buffers.iter().fold(true, |state, buffer| state && buffer.size() >= size.get()))
+                count.get() == buffers.len() && 
+                !size.is_some_and(|size| !buffers.iter().fold(true, |state, (buffer, _, _)| state && buffer.size() >= size.get() as u64))
             },
             (Binding::Sampler(sampler), BindingFormatType::Sampler(sampler_binding_type), None) => {
                 true // TODO: check for sampler type
@@ -650,27 +660,29 @@ impl<'a> Binding<'a> {
                 count.get() == samplers.len() // TODO: check for sampler type
             }, 
             (Binding::TextureView(texture_view), BindingFormatType::Texture { aspect, sample_type, dimension, multisample }, None) => {
-                texture_view.texture().format().sample_type(Some(aspect), Some(System::device().features())) == Some(sample_type) &&
-                texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+                texture_view.desc.aspect == aspect &&
+                !texture_view.format().is_some_and(|format_| format_.sample_type(Some(aspect), Some(System::device().features())) != Some(sample_type)) &&
+                !texture_view.dimension().is_some_and(|dimension_| dimension_ != dimension)
             },
             (Binding::TextureView(texture_view), BindingFormatType::Image { access, format, dimension }, None) => {
-                texture_view.texture().format().remove_srgb_suffix() == format.remove_srgb_suffix() &&
-                texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+                !texture_view.format().is_some_and(|format_| format_.remove_srgb_suffix() != format.remove_srgb_suffix()) &&
+                !texture_view.dimension().is_some_and(|dimension_| dimension_ != dimension)
             },
             (Binding::TextureViewArray(texture_views), BindingFormatType::Texture { aspect, sample_type, dimension, multisample }, Some(count)) => {
                 count.get() == texture_views.len() &&
                 texture_views.iter().fold(true, |state, texture_view| {
                     state &&
-                    texture_view.texture().format().sample_type(Some(aspect), Some(System::device().features())) == Some(sample_type) &&
-                    texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+                    texture_view.desc.aspect == aspect &&
+                    !texture_view.format().is_some_and(|format_| format_.sample_type(Some(aspect), Some(System::device().features())) != Some(sample_type)) &&
+                    !texture_view.dimension().is_some_and(|dimension_| dimension_ != dimension)
                 })
             },
             (Binding::TextureViewArray(texture_views), BindingFormatType::Image { access, format, dimension }, Some(count)) => {
                 count.get() == texture_views.len() &&
                 texture_views.iter().fold(true, |state, texture_view| {
                     state &&
-                    texture_view.texture().format().remove_srgb_suffix() == format.remove_srgb_suffix() &&
-                    texture_view.texture().dimension() == dimension.compatible_texture_dimension()
+                    !texture_view.format().is_some_and(|format_| format_.remove_srgb_suffix() != format.remove_srgb_suffix()) &&
+                    !texture_view.dimension().is_some_and(|dimension_| dimension_ != dimension)
                 })
             },
             _ => false
@@ -680,33 +692,33 @@ impl<'a> Binding<'a> {
 
 pub struct BindingGroup<'a> {
     format: Arc<BindingGroupFormat>,
-    bindings: Mutex<HashMap<usize, Binding<'a>>>,
-    bindgroup: Mutex<Option<Arc<wgpu::BindGroup>>>
+    bindings: HashMap<usize, Binding<'a>>,
+    bindgroup: Option<Arc<wgpu::BindGroup>>
 }
 
 impl<'a> BindingGroup<'a> {
     pub fn new(format: Arc<BindingGroupFormat>) -> anyhow::Result<Self> {
         Ok(Self {
             format: format.clone(),
-            bindgroup: Mutex::new(None),
-            bindings: Mutex::new(HashMap::with_capacity(format.bindings.len())),
+            bindgroup: None,
+            bindings: HashMap::with_capacity(format.bindings.len()),
         })
     }
 
     #[inline]
-    pub fn bind(&self, index: usize, binding: Binding<'a>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind(&mut self, index: usize, binding: Binding<'a>) -> anyhow::Result<Option<Binding<'a>>> {
         if let Some(binding_format) = self.format.bindings.get(&index) {
             if !binding.verify(binding_format) {
                 anyhow::bail!("Binding is not compatible with associated format");
             }
-            Ok(self.bindings.lock().insert(index, binding))
+            Ok(self.bindings.insert(index, binding))
         } else {
             anyhow::bail!("Binding index does not exist in the format");
         }
     }
 
     #[inline]
-    pub fn named_bind(&self, name: &str, binding: Binding<'a>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind(&mut self, name: &str, binding: Binding<'a>) -> anyhow::Result<Option<Binding<'a>>> {
         if let Some(index) = self.format.named_bindings.get(name) {
             self.bind(*index, binding)
         } else {
@@ -715,66 +727,66 @@ impl<'a> BindingGroup<'a> {
     }
 
     #[inline]
-    pub fn bind_buffer_slice(&self, index: usize, buffer: util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind_buffer_slice(&mut self, index: usize, buffer: util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>) -> anyhow::Result<Option<Binding<'a>>> {
         self.bind(index, Binding::Buffer(buffer))
     }
 
     #[inline]
-    pub fn bind_buffer_slices(&self, index: usize, buffers: &'a [util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>]) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind_buffer_slices(&mut self, index: usize, buffers: &'a [util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>]) -> anyhow::Result<Option<Binding<'a>>> {
         self.bind(index, Binding::BufferArray(buffers))
     }
 
     #[inline]
-    pub fn bind_sampler(&self, index: usize, sampler: util::MaybeBorrowed<'a, texture::TextureSampler>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind_sampler(&mut self, index: usize, sampler: util::MaybeBorrowed<'a, texture::TextureSampler>) -> anyhow::Result<Option<Binding<'a>>> {
         self.bind(index, Binding::Sampler(sampler))
     }
 
     #[inline]
-    pub fn bind_samplers(&self, index: usize, samplers: &'a [util::MaybeBorrowed<'a, texture::TextureSampler>]) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind_samplers(&mut self, index: usize, samplers: &'a [util::MaybeBorrowed<'a, texture::TextureSampler>]) -> anyhow::Result<Option<Binding<'a>>> {
         self.bind(index, Binding::SamplerArray(samplers))
     }
 
     #[inline]
-    pub fn bind_texture_view(&self, index: usize, texture_view: util::MaybeBorrowed<'a, texture::TextureView>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind_texture_view(&mut self, index: usize, texture_view: util::MaybeBorrowed<'a, texture::TextureView>) -> anyhow::Result<Option<Binding<'a>>> {
         self.bind(index, Binding::TextureView(texture_view))
     }
 
     #[inline]
-    pub fn bind_texture_views(&self, index: usize, texture_views: &'a [util::MaybeBorrowed<'a, texture::TextureView>]) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn bind_texture_views(&mut self, index: usize, texture_views: &'a [util::MaybeBorrowed<'a, texture::TextureView>]) -> anyhow::Result<Option<Binding<'a>>> {
         self.bind(index, Binding::TextureViewArray(texture_views))
     }
 
     #[inline]
-    pub fn named_bind_buffer_slice(&self, name: &str, buffer: util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind_buffer_slice(&mut self, name: &str, buffer: util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>) -> anyhow::Result<Option<Binding<'a>>> {
         self.named_bind(name, Binding::Buffer(buffer))
     }
 
     #[inline]
-    pub fn named_bind_buffer_slices(&self, name: &str, buffers: &'a [util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>]) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind_buffer_slices(&mut self, name: &str, buffers: &'a [util::MaybeBorrowed<'a, buffer::ByteBufferSlice<'a>>]) -> anyhow::Result<Option<Binding<'a>>> {
         self.named_bind(name, Binding::BufferArray(buffers))
     }
 
     #[inline]
-    pub fn named_bind_sampler(&self, name: &str, sampler: util::MaybeBorrowed<'a, texture::TextureSampler>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind_sampler(&mut self, name: &str, sampler: util::MaybeBorrowed<'a, texture::TextureSampler>) -> anyhow::Result<Option<Binding<'a>>> {
         self.named_bind(name, Binding::Sampler(sampler))
     }
 
     #[inline]
-    pub fn named_bind_samplers(&self, name: &str, samplers: &'a [util::MaybeBorrowed<'a, texture::TextureSampler>]) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind_samplers(&mut self, name: &str, samplers: &'a [util::MaybeBorrowed<'a, texture::TextureSampler>]) -> anyhow::Result<Option<Binding<'a>>> {
         self.named_bind(name, Binding::SamplerArray(samplers))
     }
 
     #[inline]
-    pub fn named_bind_texture_view(&self, name: &str, texture_view: util::MaybeBorrowed<'a, texture::TextureView>) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind_texture_view(&mut self, name: &str, texture_view: util::MaybeBorrowed<'a, texture::TextureView>) -> anyhow::Result<Option<Binding<'a>>> {
         self.named_bind(name, Binding::TextureView(texture_view))
     }
 
     #[inline]
-    pub fn named_bind_texture_views(&self, name: &str, texture_views: &'a [util::MaybeBorrowed<'a, texture::TextureView>]) -> anyhow::Result<Option<Binding<'a>>> {
+    pub fn named_bind_texture_views(&mut self, name: &str, texture_views: &'a [util::MaybeBorrowed<'a, texture::TextureView>]) -> anyhow::Result<Option<Binding<'a>>> {
         self.named_bind(name, Binding::TextureViewArray(texture_views))
     }
 
-    pub fn rebind(&self) -> anyhow::Result<()> {
+    pub fn rebind(&mut self) -> anyhow::Result<()> {
         enum ResourceIndex {
             Buffer(usize),
             BufferArray(std::ops::Range<usize>),
@@ -784,13 +796,12 @@ impl<'a> BindingGroup<'a> {
             TextureViewArray(std::ops::Range<usize>),
         }
 
-        let bindings_lock = self.bindings.lock();
         let mut indices = Vec::with_capacity(self.format.bindings.len());
         let mut buffer_resources = Vec::new();
         let mut sampler_resources = Vec::new();
         let mut texture_resources = Vec::new();
         for (i, binding_format) in self.format.bindings.iter() {
-            if let Some(binding) = bindings_lock.get(i) {
+            if let Some(binding) = self.bindings.get(i) {
                 if !binding.verify(binding_format) {
                     anyhow::bail!("Binding is not compatible with associated format");
                 }
@@ -878,7 +889,7 @@ impl<'a> BindingGroup<'a> {
             }
         }
 
-        self.bindgroup.lock().replace(Arc::new(System::device().create_bind_group(&wgpu::BindGroupDescriptor {
+        self.bindgroup.replace(Arc::new(System::device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.format.layout,
             entries: &entries,
@@ -889,6 +900,6 @@ impl<'a> BindingGroup<'a> {
 
     #[inline]
     pub fn wgpu_bind_group(&self) -> Option<Arc<wgpu::BindGroup>> {
-        self.bindgroup.lock().as_ref().map(|bind_group| bind_group.clone())
+        self.bindgroup.as_ref().map(|bind_group| bind_group.clone())
     }
 }
