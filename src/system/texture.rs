@@ -86,7 +86,7 @@ pub struct TextureView<'a> {
     pub(super) texture: Option<Arc<wgpu::Texture>>,
     pub(super) texture_view: Arc<wgpu::TextureView>,
     pub(super) desc: wgpu::TextureViewDescriptor<'static>,
-    phantom: PhantomData<&'a Texture>
+    pub(super) phantom: PhantomData<&'a Texture>
 }
 
 impl<'a> TextureView<'a> {
@@ -123,18 +123,33 @@ pub struct SubTexture<'a> {
 }
 
 impl<'a> SubTexture<'a> {
+    #[inline]
+    pub fn forget_lifetime(self) -> SubTexture<'static> {
+        SubTexture {
+            texture: self.texture,
+            origin: self.origin,
+            size: self.size,
+            mip_level: self.mip_level,
+            aspect: self.aspect,
+            phantom: PhantomData,
+        }
+    }
+
+    #[inline]
     pub(super) fn texel_copy_size(&self) -> Option<u32> {
         self.format().block_copy_size(Some(self.aspect))
     }
 
+    #[inline]
     pub(super) fn texel_dimensions(&self) -> (u32, u32) {
         self.format().block_dimensions()
     }
 
-    pub(super) fn image_data_layout(&self, offset: u64) -> Option<wgpu::ImageDataLayout> {
+    #[inline]
+    pub(super) fn texel_copy_buffer_layout(&self, offset: u64) -> Option<wgpu::TexelCopyBufferLayout> {
         self.texel_copy_size().map(|block_copy_size| {
             let (w, h) = self.texel_dimensions();
-            wgpu::ImageDataLayout { 
+            wgpu::TexelCopyBufferLayout { 
                 offset, 
                 bytes_per_row: Some((self.size.width / w) * block_copy_size), 
                 rows_per_image: Some(self.size.height / h)
@@ -142,10 +157,12 @@ impl<'a> SubTexture<'a> {
         })
     }
 
+    #[inline]
     pub fn format(&self) -> wgpu::TextureFormat {
         self.texture.format().aspect_specific_format(self.aspect).unwrap_or_else(|| self.texture.format())
     }
 
+    #[inline]
     pub fn total_size(&self) -> Option<usize> {
         self.texel_copy_size().map(|block_copy_size| {
             let (w, h) = self.texel_dimensions();
@@ -156,8 +173,9 @@ impl<'a> SubTexture<'a> {
         })
     }
 
-    pub(super) fn image_copy_texture(&self) -> wgpu::ImageCopyTexture<'_> {
-        wgpu::ImageCopyTextureBase { 
+    #[inline]
+    pub(super) fn image_copy_texture(&self) -> wgpu::TexelCopyTextureInfo<'_> {
+        wgpu::TexelCopyTextureInfoBase { 
             texture: &self.texture, 
             mip_level: self.mip_level, 
             origin: self.origin, 
@@ -165,13 +183,12 @@ impl<'a> SubTexture<'a> {
         }
     }
 
-
-
+    #[inline]
     pub fn write(&self, data: &[u8]) -> anyhow::Result<()> {
         System::queue().write_texture(
             self.image_copy_texture(), 
             data, 
-            self.image_data_layout(0).ok_or_else(|| anyhow::anyhow!("This texture has a format that cannot be written to!"))?, 
+            self.texel_copy_buffer_layout(0).ok_or_else(|| anyhow::anyhow!("This texture has a format that cannot be written to!"))?, 
             self.size
         );
         Ok(())
@@ -272,6 +289,7 @@ impl Texture {
                 self.format().remove_srgb_suffix()
             }),
             dimension,
+            usage: None,
             aspect,
             base_mip_level: base_mip_level as u32,
             mip_level_count: Some(mip_level_count as u32),

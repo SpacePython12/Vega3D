@@ -60,7 +60,11 @@ pub trait BinaryData: Sized + Clone + Copy {
 // impl BinaryData for wgpu::util::DrawIndirectArgs {}
 // impl BinaryData for wgpu::util::DrawIndexedIndirectArgs {}
 
-impl<T: Sized + Clone + Copy + bytemuck::Pod + bytemuck::AnyBitPattern> BinaryData for T {}
+// impl<T: Sized + Clone + Copy> BinaryData for T 
+// where T: bytemuck::AnyBitPattern + bytemuck::NoUninit {}
+
+impl<T: Sized + Clone + Copy> BinaryData for T 
+where T: bytemuck::Pod {}
 
 use std::sync::{Arc, OnceLock};
 use parking_lot::*;
@@ -72,7 +76,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 pub trait GameHandler: Send + Sync + 'static {
     fn init(&mut self, event_loop: &mut EventLoop<'_>) -> anyhow::Result<()>;
 
-    fn redraw<'a>(&mut self, event_loop: &mut EventLoop<'_>, window_id: window::WindowId, frame: &texture::Texture) -> anyhow::Result<()>;
+    fn redraw<'a>(&mut self, event_loop: &mut EventLoop<'_>, window_id: window::WindowId, frame: &texture::TextureView<'_>) -> anyhow::Result<()>;
 
     fn on_window_close(&mut self, event_loop: &mut EventLoop<'_>, window_id: window::WindowId) -> anyhow::Result<()> {
         Ok(())
@@ -169,11 +173,10 @@ impl System {
         if SYSTEM_INSTANCE.get().is_some() {
             return Ok(false);
         }
-        let instance = Arc::new(wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::util::backend_bits_from_env().unwrap_or_default(),
+        let instance = Arc::new(wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::from_env().unwrap_or_default(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
             flags: wgpu::InstanceFlags::default(),
-            dx12_shader_compiler: wgpu::util::dx12_shader_compiler_from_env().unwrap_or_default(),
-            gles_minor_version: wgpu::util::gles_minor_version_from_env().unwrap_or_default(),
         }));
 
         let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None).await.ok_or(anyhow::anyhow!("No adapter found"))?;
@@ -182,15 +185,8 @@ impl System {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    required_features: 
-                        wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | 
-                        wgpu::Features::CLEAR_TEXTURE | 
-                        wgpu::Features::POLYGON_MODE_LINE | 
-                        wgpu::Features::DEPTH32FLOAT_STENCIL8,
-                    required_limits: wgpu::Limits {
-                        min_uniform_buffer_offset_alignment: 64,
-                        ..Default::default()
-                    },
+                    required_features: adapter.features(),
+                    required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::default()
                 },
                 None,
@@ -231,7 +227,7 @@ impl System {
     }
 
     pub fn create_window_async<F: FnOnce(window::WindowId) + 'static + Send>(f: F) {
-        let mut attrs = winit::window::WindowAttributes::default();
+        let attrs = winit::window::WindowAttributes::default();
         Self::this().window_queue.get().expect("create_window_async cannot be called before the event loop is started!").send((attrs, Box::new(f))).unwrap();
     }
 
@@ -247,14 +243,15 @@ impl System {
         Self::this().windows.write().remove(&window_id);
     }
 
-    pub fn register_vertex_format_element(name: &str, format: Arc<pipeline::VertexFormatElement>) -> anyhow::Result<()> {
+    pub fn register_vertex_format_element(name: Option<&str>, format: pipeline::VertexFormatElement) -> anyhow::Result<()> {
         let mut lock = Self::this().vertex_format_elements.write();
+        let name = name.unwrap_or(&format.name);
 
         if lock.contains_key(name) {
             anyhow::bail!("Vertex format element {} is already registered!", name);
         }
 
-        lock.insert(name.to_owned(), format);
+        lock.insert(name.to_owned(), format.into());
 
         Ok(())
     }
@@ -265,14 +262,14 @@ impl System {
         lock.get(name).cloned()
     }
 
-    pub fn register_vertex_format(name: &str, format: Arc<pipeline::VertexFormat>) -> anyhow::Result<()> {
+    pub fn register_vertex_format(name: &str, format: pipeline::VertexFormat) -> anyhow::Result<()> {
         let mut lock = Self::this().vertex_formats.write();
 
         if lock.contains_key(name) {
             anyhow::bail!("Vertex format {} is already registered!", name);
         }
 
-        lock.insert(name.to_owned(), format);
+        lock.insert(name.to_owned(), format.into());
 
         Ok(())
     }
@@ -283,8 +280,9 @@ impl System {
         lock.get(name).cloned()
     }
 
-    pub fn register_binding_format(name: &str, format: Arc<pipeline::BindingFormat>) -> anyhow::Result<()> {
+    pub fn register_binding_format(name: Option<&str>, format: Arc<pipeline::BindingFormat>) -> anyhow::Result<()> {
         let mut lock = Self::this().binding_formats.write();
+        let name = name.unwrap_or(&format.name);
 
         if lock.contains_key(name) {
             anyhow::bail!("Binding format {} is already registered!", name);
@@ -319,8 +317,12 @@ impl System {
         lock.get(name).cloned()
     }
 
-    pub fn flush_all() {
+    pub fn submit_all() {
         Self::queue().submit(None);
+    }
+
+    pub fn submit(command_buffers: impl IntoIterator<Item = pipeline::CommandBuffer>) {
+        Self::queue().submit(command_buffers.into_iter().map(|command_buffer| command_buffer.buffer));
     }
 
     pub(self) fn queue() -> &'static Arc<wgpu::Queue> {
@@ -495,10 +497,27 @@ impl winit::application::ApplicationHandler<gilrs::Event> for SystemEventHandler
                     }
                 };
 
-                let frame_texture = texture::Texture::new_with(&frame.texture);
+                let desc = wgpu::TextureViewDescriptor {
+                    label: None,
+                    format: None,
+                    dimension: None,
+                    usage: None,
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: 0,
+                    mip_level_count: None,
+                    base_array_layer: 0,
+                    array_layer_count: None,
+                };
+
+                let frame_view = texture::TextureView {
+                    texture: None,
+                    texture_view: Arc::new(frame.texture.create_view(&desc)),
+                    desc: desc,
+                    phantom: std::marker::PhantomData,
+                };
 
 
-                let res = handler.lock().redraw(&mut system, window_id, &frame_texture);
+                let res = handler.lock().redraw(&mut system, window_id, &frame_view);
 
                 frame.present();
                 window.request_redraw();

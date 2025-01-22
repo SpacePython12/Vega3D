@@ -23,6 +23,17 @@ pub type ByteBufferSlice<'a> = BufferSlice<'a, [u8]>;
 
 impl<'a, T: ?Sized> BufferSlice<'a, T> {
     #[inline]
+    pub fn forget_lifetime(self) -> BufferSlice<'static, T> {
+        BufferSlice {
+            buffer: self.buffer.clone(),
+            offset: self.offset,
+            size: self.size,
+            mapped: self.mapped,
+            phantom: PhantomData,
+        }
+    }
+
+    #[inline]
     pub fn cast_to<U: BinaryData>(self) -> BufferSlice<'a, U> {
         assert_eq!(self.size(), size_of::<U>());
         BufferSlice {
@@ -144,8 +155,13 @@ impl<'a, T: BinaryData> BufferSlice<'a, T> {
 }
 
 impl<'a, T: BinaryData> BufferSlice<'a, [T]> {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.size() / std::mem::size_of::<T>()
+    }
+
     pub fn write_array(&self, data: &[T]) {
-        assert_eq!(self.size.get(), data.len() as u64);
+        assert_eq!(self.len(), data.len());
         System::queue().write_buffer(&self.buffer, self.offset, T::slice_to_bytes(data));
     }
 

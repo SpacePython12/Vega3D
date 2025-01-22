@@ -44,3 +44,13 @@ where B: 'b {
         MaybeBorrowed::Owned(value)
     }
 }
+
+impl<'b, B> std::fmt::Debug for MaybeBorrowed<'b, B>
+where B: std::fmt::Debug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MaybeBorrowed::Borrowed(val) => val.fmt(f),
+            MaybeBorrowed::Owned(val) => val.fmt(f),
+        }
+    }
+} 
